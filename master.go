@@ -105,6 +105,7 @@ func sumSlices(s1[]float64, s2[]float64) (result[]float64){
 }
 
 var request WorkerRequest
+var centroids [][]float64
 var dataSet []Data
 var contSolution int
 var safeMapReduce SafeMapReduce = SafeMapReduce{
