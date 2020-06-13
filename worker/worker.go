@@ -1,8 +1,5 @@
 package main
 import (
-	/* 
-	"strconv"
-	*/
 	"os"
 	"net"
 	"math"
@@ -10,7 +7,6 @@ import (
 	"bufio"
 	"strings"
 	"encoding/json"
-	/* "sync" */
 )
 const (
 	REGISTER_WORKER = 2
@@ -106,13 +102,18 @@ func handlerMaster(){
 		os.Exit(1)
 	}
 	for {
-		conn, errWorker := ln.Accept()
+		
+			conn, errWorker := ln.Accept()
 		if errWorker != nil {
 			fmt.Println("Ha ocurrido un error en la recepcion de la peticion del master")
 		}
+		go func(){
 		req, _ := bufio.NewReader(conn).ReadString('\n')
+		
 		json.Unmarshal([]byte(req),&request)
 		groupInstancesByCentroid()
+		} ()
+		
 	}
 }
 
@@ -179,6 +180,6 @@ func main(){
 	notifyMeToMaster()
 	go handlerMaster()
 	for {
-		
+
 	}
 }

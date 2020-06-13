@@ -1,8 +1,11 @@
 package main 
 
 import (
-	"strings"
 	"strconv"
+	"io/ioutil"
+	"errors"
+	"math/rand"
+	"strings"
 	"fmt"
 	"bufio"
 	"os"
@@ -10,7 +13,29 @@ import (
 	"net"
 	"encoding/json"
 	"sync"
+	"net/http"
 )
+
+const (
+	REGISTER_WORKER = 2
+	SOLUTION_WORKER = 3
+	MIN_WORKERS = 2 
+)
+
+type HttpRequest struct {
+	KMeans string  `json:"k-means"`
+	Threshold string `json:"threshold"`
+	Iterations string `json:"iterations"`
+}
+
+type Data struct {
+	Id int `json:"id"`
+	Dimensions  []float64 `json:"Dimensions"`
+}
+func (data Data) toJson() string {
+	json, _ := json.Marshal(data)
+	return string(json)
+}
 
 type TCPResponse struct{
 	Id int `json:"id"`
@@ -23,19 +48,11 @@ func (t TCPResponse) toJson() string {
 } 
 
 
-
-var rol int
 var masterInfo MasterIp
-var workerInfo WorkerIp
-
-var partialSolutions = make(chan Solution)
-
+var kMeans int 
+var limits float64 
+var iterations int 
 var workerIps []string
-
-type FinalSolution struct {
-	Centroids []Data `json:"centroids"`
-	Instances []Data `json:"instances"`
-}
 
 type WorkerIp struct {
 	MasterIp string `json:"master_ip"`
@@ -67,7 +84,7 @@ type Solution struct {
 	Data map[int] CombineResult `json:"Data"`
 } 
 
-var response Solution
+
 
 type WorkerRequest struct {
 	Instances []Data `json:"instances"`
@@ -92,6 +109,7 @@ func (c *SafeMapReduce) Inc(s Solution){
 			}
 			c.v[k] = sumSlices(c.v[k],v.Total)
 			c.conts[k] += len(v.Instances)
+			response[k] = append(response[k],v.Instances...)
 		}
 	c.mux.Unlock()
 }
@@ -104,28 +122,22 @@ func sumSlices(s1[]float64, s2[]float64) (result[]float64){
 	return
 }
 
+
+
+
+
 var request WorkerRequest
-var centroids [][]float64
+var centroids []Data
 var dataSet []Data
+var response map[int][]Data = make(map[int][]Data)
 var contSolution int
+var contIteration int 
+var limitReached bool
 var safeMapReduce SafeMapReduce = SafeMapReduce{
 	v:make(map[int][]float64),
 	conts: make(map[int]int)}
 
-func registerWorker(){
-	ginMasterIp := bufio.NewReader(os.Stdin)
-	fmt.Print("Registra la ip:port de mi master: ")
-	masterIp, _ := ginMasterIp.ReadString('\n')
-	masterIp = strings.TrimSpace(masterIp)
-
-	ginIp := bufio.NewReader(os.Stdin)
-	fmt.Print("Registra mi ip:port : ")
-	ip, _ := ginIp.ReadString('\n')
-	ip = strings.TrimSpace(ip)
-
-	workerInfo = WorkerIp{Ip: ip, MasterIp: masterIp}
-	fmt.Printf("Mi info es %+v\n",workerInfo)
-}
+var httpResp = make(chan bool) 
 
 func registerMaster(){
 	ginIp := bufio.NewReader(os.Stdin)
@@ -156,11 +168,13 @@ func handlerWorkers(){
 	}
 	defer ln.Close()
 	for {
-		conn, errWorker := ln.Accept()
+		
+			conn, errWorker := ln.Accept()
 		if errWorker != nil {
 			fmt.Println("Ha ocurrido un error en la recepcion de la solucion de un worker")
 		}
 		defer conn.Close()
+		go func(){
 		resp, _ := bufio.NewReader(conn).ReadString('\n')
 		var respAux TCPResponse 
 		json.Unmarshal([]byte(resp), &respAux)
@@ -175,6 +189,7 @@ func handlerWorkers(){
 			json.Unmarshal([]byte(respAux.Data),&handleResp)
 			Reduce(handleResp)
 		}
+		}()
 		 
 	}
 
@@ -186,15 +201,40 @@ func Reduce(resp Solution) {
 	if (contSolution == 2){
 		updateCentroids()
 		contSolution = 0
+		contIteration += 1
+		if  contIteration < iterations || !limitReached{
+			safeMapReduce = SafeMapReduce{
+				v:make(map[int][]float64),
+				conts: make(map[int]int)}
+			for k,_ := range response {
+				response[k] = make([]Data,0)
+			}
+			chunksInitialize()
+			
+		}else{
+			
+			file, _ := json.MarshalIndent(response, "", " ")
+			_ = ioutil.WriteFile("../data/response.json", file, 0644)
+			httpResp <- true
+		}
 	}
+	
 	
 }
 
 func updateCentroids() {
+	var contAux int 
 	 for k,v := range safeMapReduce.v {
-		fmt.Printf("\nCentroid updated %v",sumTotalCentroids(v,safeMapReduce.conts[k]))
-	} 
-
+		dimensions  := sumTotalCentroids(v,safeMapReduce.conts[k])
+		distance := CalculateDistancePoints(dimensions,centroids[k].Dimensions)
+		if distance <= limits{
+			contAux += 1
+		}
+		centroids[k].Dimensions = dimensions  
+	}
+	if contAux == len(centroids){
+		limitReached = true
+	}
 }
 
 func sumTotalCentroids( dimensions[]float64,length int)(result[]float64){
@@ -205,95 +245,31 @@ func sumTotalCentroids( dimensions[]float64,length int)(result[]float64){
 }
 
 
-func notifyMeToMaster(){
-	conn, _ := net.Dial("tcp",workerInfo.MasterIp)
-	defer conn.Close()
-	fmt.Fprintln(conn,TCPResponse{Data:workerInfo.toJson(),Id:REGISTER_WORKER}.toJson())
-	msg, _ := bufio.NewReader(conn).ReadString('\n')
-	fmt.Println(msg) 
-}
 
-func sendSolution(){
-	conn, _ := net.Dial("tcp",workerInfo.MasterIp)
-	defer conn.Close()
-	resp, _ := json.Marshal(response)
-	fmt.Fprintln(conn,TCPResponse{Data:string(resp),Id:SOLUTION_WORKER}.toJson())
-	msg, _ := bufio.NewReader(conn).ReadString('\n')
-	fmt.Println(msg) 
-}
-
-func handlerMaster(){
-	ln, err := net.Listen("tcp",workerInfo.Ip)
-	defer ln.Close()
-	if err != nil {
-		fmt.Println("Error when enable listener port for master")
-		os.Exit(1)
-	}
-	for {
-		conn, errWorker := ln.Accept()
-		if errWorker != nil {
-			fmt.Println("Ha ocurrido un error en la recepcion de la peticion del master")
-		}
-		req, _ := bufio.NewReader(conn).ReadString('\n')
-		json.Unmarshal([]byte(req),&request)
-		groupInstancesByCentroid()
-	}
-}
 
 func init(){
-	dataSet = []Data{
-		{
-			Id: 1,
-			Dimensions: []float64{30.0,50.0},
-			Cluster:1,	
-		},
-		{
-			Id: 2,
-			Dimensions: []float64{80.0,100.0},
-			Cluster:2,	
-		},
-		{
-			Id: 3,
-			Dimensions: []float64{140.0,300.0},	
-			Cluster:3,
-		},
-		{
-			Id: 4,
-			Dimensions: []float64{500.0,100.0},	
-			Cluster:4,
-		},
-		{
-			Id: 5,
-			Dimensions: []float64{700.0,400.0},	
-			Cluster:5,
-		},
-		{
-			Id: 6,
-			Dimensions: []float64{90.0,200.0},	
-			Cluster:6,
-		},
-		{
-			Id: 7,
-			Dimensions: []float64{91.0,202.0},	
-			Cluster:7,
-		},
-		{
-			Id: 8,
-			Dimensions: []float64{93.0,203.0},	
-			Cluster:8,
-		},
-		{
-			Id: 9,
-			Dimensions: []float64{94.0,204.0},	
-			Cluster:9,
-		},
+	jsonFile, err := os.Open("../data/dataSet.json")
+	defer jsonFile.Close()
+	if err != nil {
+		fmt.Println(err)
 	}
-
+	byteValue, _ := ioutil.ReadAll(jsonFile)
+	json.Unmarshal(byteValue, &dataSet)
 }
 
 
-func master(){
-	fmt.Print("Soy el master")
+
+func CalculateDistancePoints(p1 []float64, p2 []float64) float64{
+	var distance float64
+	if len(p1) != len(p2) {
+		err2 := errors.New("Las dimensiones de los puntos no coinciden")
+		fmt.Println("Fatal Error:", err2.Error())
+		os.Exit(1)
+	} 
+	for i := range p1 {
+		distance += math.Pow(p1[i] - p2[i], 2.0)
+	}
+	return math.Sqrt(distance)
 }
 
 func CalculateDistance(instance Data, centroid Data) float64{
@@ -329,26 +305,8 @@ func sumDimensions(total []float64, newInstance Data )(clusterDimension[]float64
 }
 
 
-func groupInstancesByCentroid() {
-	response.Data = make(map[int]CombineResult)
-	for _,instance := range request.Instances{
-		var distances []InstanceDistance
-		for _,centroid := range request.Centroids{
-			distances = append(distances,InstanceDistance{clusterId: centroid.Id, distance: CalculateDistance(instance,centroid)})
-		}
-		closestCluster := FindClosestCluster(distances)
-		currentCluster :=  response.Data[closestCluster.clusterId]
-		response.Data[closestCluster.clusterId] = CombineResult{
-			Instances: append(currentCluster.Instances,instance),
-			Total : sumDimensions(currentCluster.Total,instance),
-		}
-	}
-	sendSolution()
-}
 
-func worker(){
-	fmt.Print("Soy un worker")
-}
+
 
 func sendChunk(chunk []Data, centroids []Data,workerIp string){
 	conn, err	:= net.Dial("tcp",workerIp)
@@ -362,13 +320,7 @@ func sendChunk(chunk []Data, centroids []Data,workerIp string){
 }
 
 func chunksInitialize(){
-	for {
-		if len(workerIps) > 1 {
-			centroids := []Data{
-				dataSet[1],
-				dataSet[2],
-			}
-			chunkLen := len(dataSet) / len(workerIps)
+	chunkLen := len(dataSet) / len(workerIps)
 			for i := range workerIps {
 				var chunks []Data
 				chunks = dataSet[chunkLen*i:chunkLen*(i+1)]
@@ -376,41 +328,69 @@ func chunksInitialize(){
 					chunks = append(chunks,dataSet[chunkLen*(i+1):]...)
 				}
 				sendChunk(chunks,centroids,workerIps[i])	
-			}
-			break;
-		}
 	}
+}
 
 
+func randomCentroids(){
+	for i := 0; i < kMeans; i++ {
+		newCentroid := Data{Id: i , Dimensions: dataSet[rand.Intn(len(dataSet))].Dimensions}
+		centroids = append(centroids,newCentroid) 
+	}
+}
+func HTTPHandlers(w http.ResponseWriter, r *http.Request) {
+    if r.URL.Path != "/" {
+        http.Error(w, "404 not found.", http.StatusNotFound)
+        return
+    }
+ 
+    switch r.Method {
+    case "GET":     
+         http.ServeFile(w, r, "./index.html")
+	case "POST":
+		
+		response = make(map[int][]Data)
+		var req HttpRequest
+		err := json.NewDecoder(r.Body).Decode(&req)
+		if err != nil {
+			fmt.Printf("%s",err.Error())
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		iterationsAux, _ :=strconv.Atoi(req.Iterations)
+		kMeansAux, _ := strconv.Atoi(req.KMeans)
+		limitsAux, _ := strconv.ParseFloat(req.Threshold,64)
+
+		iterations,limits,kMeans = iterationsAux, limitsAux, kMeansAux
+		randomCentroids()
+		chunksInitialize()
+		
+
+		w.Header().Set("Content-Type", "application/json")
+		<-httpResp
+		resp, err := json.Marshal(response)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		  } 
+		w.Write(resp)
+        
+    default:
+        fmt.Fprintf(w, "Sorry, only GET and POST methods are supported.")
+    }
 }
 
 func main(){
-	ginRol:= bufio.NewReader(os.Stdin)
-	fmt.Print("Registra mi Rol (Master: 0, Worker: 1): ")
-	resp,_ := ginRol.ReadString('\n')
-	resp = strings.TrimSpace(resp)
-	respInt,_ := strconv.Atoi(resp)
-	switch respInt {
-	case 0:
-		rol = MASTER
-		registerMaster()
-		go handlerWorkers()
-		go chunksInitialize()
-		break
-	case 1: 
-		rol = WORKER
-		registerWorker()
-		notifyMeToMaster()
-		go handlerMaster()
-		break
-	default:
-		err := fmt.Errorf("Error rol")
-		fmt.Println(err)
-		os.Exit(1)
-		break;
-	}
 
-	for {
+	rand.Seed(42)
+	registerMaster()
+	randomCentroids()
+	go handlerWorkers()
 
-	}
+	http.HandleFunc("/", HTTPHandlers)
+ 
+    fmt.Printf("\nStarting HTTP SERVER ON %s PORT...\n",masterInfo.listenerAppPort)
+    if err := http.ListenAndServe(fmt.Sprintf(":%s",masterInfo.listenerAppPort), nil); err != nil {
+        fmt.Printf("Error %s",err.Error())
+    }
 }
